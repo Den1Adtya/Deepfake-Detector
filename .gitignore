@@ -1,0 +1,14 @@
+    # Virtual Environment
+venv/
+__pycache__/
+
+# Dataset & Model AI
+dataset/
+models/*.h5
+models/*.keras
+
+# Database Lokal
+database/*.db
+
+# Environment Variables
+.env
