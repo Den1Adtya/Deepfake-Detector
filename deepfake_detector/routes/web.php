@@ -23,6 +23,9 @@ Route::middleware('auth')->group(function () {
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
     // Menampilkan halaman riwayat deteksi
     Route::get('/history', [DetectionController::class, 'history'])->name('detect.history');
+    // Menampilkan detail spesifik dari satu riwayat
+    Route::get('/history/{id}', [DetectionController::class, 'show'])->name('detect.show');
+    Route::get('/trending', [DetectionController::class, 'trending'])->name('detect.trending');
 });
 
 require __DIR__.'/auth.php';

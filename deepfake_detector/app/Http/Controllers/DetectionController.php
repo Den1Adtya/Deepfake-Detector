@@ -2,9 +2,9 @@
 
 namespace App\Http\Controllers;
 
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Storage;
 use App\Models\Prediction;
 
 class DetectionController extends Controller
@@ -16,8 +16,8 @@ class DetectionController extends Controller
         ]);
 
         $file = $request->file('image');
-        $filename = time() . '_' . $file->getClientOriginalName();
-        $path = $file->storeAs('public/uploads', $filename);
+        $imagePath = $request->file('image')->store('uploads', 'public');
+        $filename = basename($imagePath);
 
         // Kirim ke API Flask
         $response = Http::attach(
@@ -30,12 +30,14 @@ class DetectionController extends Controller
             // 1. Decode Base64 dari Flask menjadi file gambar asli
             $heatmapData = base64_decode($result['heatmap_image']);
             $heatmapFilename = 'heatmap_' . time() . '.jpg';
+            $heatmapData = base64_decode($result['heatmap_image']);
+            Storage::disk('public')->put('uploads/' . $heatmapFilename, $heatmapData);
             
-            // 2. Simpan file fisik di folder storage/app/public/uploads
-            Storage::put('public/uploads/' . $heatmapFilename, $heatmapData);
 
             Prediction::insert([
                 'filename' => $filename,
+                'heatmap_file' => $heatmapFilename,
+                'image_hash' => $result['image_hash'] ?? null,
                 'label' => $result['label'],
                 'confidence' => $result['confidence'],
                 'created_at' => now(),
@@ -52,11 +54,42 @@ class DetectionController extends Controller
         }
         return back()->with('error', 'Gagal terhubung ke server AI. Pastikan Flask menyala.');
     }
-    public function history()
+
+    public function history(Request $request)
     {
-        // Mengambil semua data prediksi dari terbaru ke terlama
-        $predictions = Prediction::orderBy('created_at', 'desc')->get();
+        $search = $request->input('search');
         
-        return view('history', compact('predictions'));
+        // Mulai query mengambil data dari terbaru
+        $query = Prediction::orderBy('created_at', 'desc');
+        
+        // Jika ada input pencarian, saring berdasarkan nama file
+        if ($search) {
+            $query->where('filename', 'like', '%' . $search . '%');
+        }
+        
+        $predictions = $query->get();
+        
+        return view('history', compact('predictions', 'search'));
+    }
+
+    public function show($id)
+    {
+        // Mencari data prediksi berdasarkan ID
+        $prediction = Prediction::findOrFail($id);
+        
+        return view('show', compact('prediction'));
+    }
+
+    public function trending()
+    {
+        // Mengelompokkan gambar berdasarkan struktur visual yang sama (pHash)
+        $trendings = Prediction::selectRaw('image_hash, COUNT(*) as total_count, MAX(filename) as sample_file, MAX(label) as label')
+            ->whereNotNull('image_hash')
+            ->groupBy('image_hash')
+            ->orderByDesc('total_count')
+            ->limit(9)
+            ->get();
+            
+        return view('trending', compact('trendings'));
     }
 }
