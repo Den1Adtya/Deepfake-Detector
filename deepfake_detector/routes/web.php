@@ -4,19 +4,25 @@ use App\Http\Controllers\ProfileController;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\DetectionController;
 use App\Models\Prediction;
+use Illuminate\Support\Facades\Auth;
 
 Route::get('/', function () {
     return view('welcome');
 });
 
 Route::get('/dashboard', function () {
+    $userId = Auth::id();
     $total = Prediction::count();
     $fake = Prediction::where('label', 'FAKE')->count();
     $real = Prediction::where('label', 'REAL')->count();
     
-    return view('dashboard', compact('total', 'fake', 'real'));
-})->middleware(['auth', 'verified'])->name('dashboard');
+    // Hitung statistik untuk Chart.js
+    $totalScans = Prediction::where('user_id', $userId)->count();
+    $totalFake = Prediction::where('user_id', $userId)->where('label', 'FAKE')->count();
+    $totalReal = Prediction::where('user_id', $userId)->where('label', 'REAL')->count();
 
+    return view('dashboard', compact('totalScans', 'totalFake', 'totalReal'));
+})->middleware(['auth', 'verified'])->name('dashboard');
 Route::middleware('auth')->group(function () {
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
