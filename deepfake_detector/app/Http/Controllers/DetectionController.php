@@ -5,12 +5,98 @@ namespace App\Http\Controllers;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
-use App\Models\Prediction;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use Illuminate\Http\Client\ConnectionException;
+use App\Models\Prediction;
+use Throwable;
 
 class DetectionController extends Controller
 {
+    /**
+     * Menyimpan gambar Base64 dari Flask ke Laravel Storage.
+     *
+     * Digunakan untuk menyimpan:
+     * - Cropped face image
+     * - Grad-CAM heatmap
+     */
+    private function storeBase64Image(?string $base64, string $prefix): ?string
+    {
+        if (empty($base64)) {
+            return null;
+        }
+
+        // Menghapus prefix data URI jika tersedia.
+        if (str_contains($base64, ',')) {
+            $base64 = explode(',', $base64, 2)[1];
+        }
+
+        // Decode Base64.
+        $imageData = base64_decode($base64, true);
+
+        if ($imageData === false) {
+            Log::warning("Gagal decode Base64 untuk gambar: {$prefix}");
+            return null;
+        }
+
+        // Validasi bahwa data benar-benar berupa gambar.
+        $imageInfo = @getimagesizefromstring($imageData);
+
+        if ($imageInfo === false) {
+            Log::warning("Data gambar tidak valid: {$prefix}");
+            return null;
+        }
+
+        // Tentukan ekstensi berdasarkan format gambar.
+        $extension = match ($imageInfo['mime'] ?? '') {
+            'image/jpeg' => 'jpg',
+            'image/png'  => 'png',
+            'image/webp' => 'webp',
+            default      => null,
+        };
+
+        if (!$extension) {
+            Log::warning("Format gambar tidak didukung: {$prefix}");
+            return null;
+        }
+
+        // Gunakan UUID agar tidak terjadi benturan nama file.
+        $filename = $prefix . '_' . Str::uuid() . '.' . $extension;
+
+        $stored = Storage::disk('public')->put(
+            'uploads/' . $filename,
+            $imageData
+        );
+
+        if (!$stored) {
+            Log::error("Gagal menyimpan gambar: {$filename}");
+            return null;
+        }
+
+        return $filename;
+    }
+
+
+    /**
+     * Menghapus file hasil pemrosesan jika terjadi kegagalan.
+     */
+    private function cleanupFiles(array $filenames): void
+    {
+        foreach ($filenames as $filename) {
+            if (!empty($filename)) {
+                Storage::disk('public')->delete('uploads/' . $filename);
+            }
+        }
+    }
+
+
+    /**
+     * DETECTION
+     * Mengirim gambar ke Flask untuk proses Face Detection,
+     * Face Cropping, EfficientNet-B2, dan Grad-CAM.
+     */
     public function detect(Request $request)
     {
         $request->validate([
@@ -18,94 +104,304 @@ class DetectionController extends Controller
         ]);
 
         $file = $request->file('image');
-        $imagePath = $request->file('image')->store('uploads', 'public');
+
+        // Simpan gambar asli.
+        $imagePath = $file->store('uploads', 'public');
+
+        if (!$imagePath) {
+            return back()->with(
+                'error',
+                'Gagal menyimpan gambar yang diunggah.'
+            );
+        }
+
         $filename = basename($imagePath);
 
-        // Kirim ke API Flask
-        $response = Http::attach(
-            'image', file_get_contents($file->getPathname()), $filename
-        )->post('http://127.0.0.1:5000/api/predict');
+        // =============================================
+        // 1. KIRIM GAMBAR KE FLASK API
+        // =============================================
 
-        if (!$response->successful() || $response->json('status') === 'error') {
-            $errorMessage = $response->json('message') ?? 'Terjadi kesalahan saat memproses gambar di server AI.';
-            
-            // Hapus gambar yang tadi terlanjur diupload pengguna agar tidak menumpuk
-            Storage::disk('public')->delete('uploads/' . $filename); 
-            
-            // Kembalikan ke halaman upload dengan pesan error
-            return back()->with('error', $errorMessage);
+        try {
+
+            $response = Http::timeout(120)
+                ->attach(
+                    'image',
+                    file_get_contents($file->getRealPath()),
+                    $filename
+                )
+                ->post('http://127.0.0.1:5000/api/predict');
+
+        } catch (ConnectionException $e) {
+
+            // Hapus gambar asli jika Flask tidak dapat dihubungi.
+            $this->cleanupFiles([$filename]);
+
+            Log::error('Flask connection error: ' . $e->getMessage());
+
+            return back()->with(
+                'error',
+                'Gagal terhubung ke server AI. Pastikan Flask sedang berjalan.'
+            );
         }
-        
-        if ($response->successful()) {
-            $result = $response->json();
-            
-            // 1. Decode Base64 dari Flask menjadi file gambar asli
-            $heatmapData = base64_decode($result['heatmap_image']);
-            $heatmapFilename = 'heatmap_' . time() . '.jpg';
-            $heatmapData = base64_decode($result['heatmap_image']);
-            Storage::disk('public')->put('uploads/' . $heatmapFilename, $heatmapData);
-            
 
-            Prediction::insert([
-                'user_id' => Auth::id(),
-                'filename' => $filename,
-                'heatmap_file' => $heatmapFilename,
-                'analysis_details' => isset($result['regional_analysis']) ? json_encode($result['regional_analysis']) : null,
-                'image_hash' => $result['image_hash'] ?? null,
-                'label' => $result['label'],
-                'confidence' => $result['confidence'],
-                'created_at' => now(),
-                'updated_at' => now(),
+
+        // =============================================
+        // 2. PERIKSA RESPONSE FLASK
+        // =============================================
+
+        if (
+            !$response->successful() ||
+            $response->json('status') !== 'success'
+        ) {
+
+            $errorMessage = $response->json('message')
+                ?? 'Terjadi kesalahan saat memproses gambar di server AI.';
+
+            $this->cleanupFiles([$filename]);
+
+            return back()
+                ->withInput()
+                ->with('error', $errorMessage);
+        }
+
+        $result = $response->json();
+
+
+        // Pastikan hasil prediksi tersedia.
+        if (
+            empty($result['label']) ||
+            !isset($result['confidence'])
+        ) {
+
+            $this->cleanupFiles([$filename]);
+
+            return back()->with(
+                'error',
+                'Response server AI tidak memiliki hasil prediksi yang valid.'
+            );
+        }
+
+
+        // =============================================
+        // 3. SIMPAN HASIL CROP WAJAH
+        // =============================================
+
+        $croppedFilename = $this->storeBase64Image(
+            $result['cropped_image'] ?? null,
+            'cropped'
+        );
+
+
+        // =============================================
+        // 4. SIMPAN GRAD-CAM HEATMAP
+        // =============================================
+
+        $heatmapFilename = $this->storeBase64Image(
+            $result['heatmap_image'] ?? null,
+            'heatmap'
+        );
+
+
+        // =============================================
+        // 5. SIMPAN DATA PREDIKSI KE DATABASE
+        // =============================================
+
+        try {
+
+            DB::transaction(function () use (
+                $result,
+                $filename,
+                $croppedFilename,
+                $heatmapFilename
+            ) {
+
+                Prediction::insert([
+
+                    'user_id' => Auth::id(),
+
+                    // Gambar asli.
+                    'filename' => $filename,
+
+                    // Gambar hasil crop wajah.
+                    'cropped_file' => $croppedFilename,
+
+                    // Grad-CAM.
+                    'heatmap_file' => $heatmapFilename,
+
+                    // Analisis regional wajah.
+                    'analysis_details' => isset($result['regional_analysis'])
+                        ? json_encode($result['regional_analysis'])
+                        : null,
+
+                    // Perceptual Hash.
+                    'image_hash' => $result['image_hash'] ?? null,
+
+                    // Hasil klasifikasi.
+                    'label' => $result['label'],
+
+                    'confidence' => $result['confidence'],
+
+                    'created_at' => now(),
+
+                    'updated_at' => now(),
+
+                ]);
+
+            });
+
+        } catch (Throwable $e) {
+
+            // Bersihkan seluruh file jika database gagal menyimpan.
+            $this->cleanupFiles([
+                $filename,
+                $croppedFilename,
+                $heatmapFilename,
             ]);
 
-            // 3. Kembalikan nama file-nya saja ke session, BUKAN teks Base64
-            return back()->with([
-                'success' => true,
-                'label' => $result['label'],
-                'confidence' => $result['confidence'],
-                'heatmap_image' => $heatmapFilename, 
-            ]);
+            Log::error('Prediction database error: ' . $e->getMessage());
+
+            return back()->with(
+                'error',
+                'Gagal menyimpan hasil analisis ke database.'
+            );
         }
-        return back()->with('error', 'Gagal terhubung ke server AI. Pastikan Flask menyala.');
+
+
+        // =============================================
+        // 6. KEMBALIKAN HASIL KE HALAMAN DETECT
+        // =============================================
+
+        return back()->with([
+
+            'success' => true,
+
+            'label' => $result['label'],
+
+            'confidence' => $result['confidence'],
+
+            'heatmap_image' => $heatmapFilename,
+
+            'cropped_image' => $croppedFilename,
+
+        ]);
     }
 
-   public function history(Request $request)
+
+    /**
+     * HISTORY
+     * Menampilkan riwayat deteksi milik pengguna.
+     */
+    public function history(Request $request)
     {
         $search = $request->input('search');
-        
-        // Mulai query dengan memfilter HANYA data milik user yang sedang login
+
         $query = Prediction::where('user_id', Auth::id())
-                           ->orderBy('created_at', 'desc');
-        
-        // Jika ada input pencarian, saring berdasarkan nama file
+            ->orderBy('created_at', 'desc');
+
         if ($search) {
-            $query->where('filename', 'like', '%' . $search . '%');
+            $query->where(
+                'filename',
+                'like',
+                '%' . $search . '%'
+            );
         }
-        
+
         $predictions = $query->get();
-        
-        return view('history', compact('predictions', 'search'));
+
+        return view('history', compact(
+            'predictions',
+            'search'
+        ));
     }
 
+
+    /**
+     * SHOW
+     * Menampilkan detail hasil identifikasi.
+     */
     public function show($id)
     {
-        // Mencari data prediksi berdasarkan ID
         $prediction = Prediction::findOrFail($id);
-        
+
         return view('show', compact('prediction'));
     }
 
+
+    /**
+     * TRENDING
+     * Mengelompokkan gambar berdasarkan perceptual hash.
+     * Prioritaskan gambar crop untuk preview.
+     */
     public function trending()
     {
-        // Mengelompokkan gambar berdasarkan struktur visual yang sama (pHash)
-        $trendings = Prediction::selectRaw('image_hash, COUNT(*) as total_count, MAX(filename) as sample_file, MAX(label) as label')
+        // Ambil kelompok gambar berdasarkan image_hash.
+        $trendGroups = Prediction::selectRaw('
+                image_hash,
+                COUNT(*) as total_count
+            ')
             ->whereNotNull('image_hash')
             ->groupBy('image_hash')
             ->having('total_count', '>=', 3)
             ->orderByDesc('total_count')
             ->limit(9)
             ->get();
-            
+
+
+        // Jika belum ada data trending.
+        if ($trendGroups->isEmpty()) {
+
+            return view('trending', [
+                'trendings' => collect(),
+            ]);
+
+        }
+
+
+        // Ambil seluruh record dari kelompok hash tersebut.
+        $hashes = $trendGroups->pluck('image_hash');
+
+        $records = Prediction::whereIn('image_hash', $hashes)
+            ->orderByDesc('created_at')
+            ->get()
+            ->groupBy('image_hash');
+
+
+        // Tentukan gambar yang digunakan sebagai preview.
+        $trendings = $trendGroups->map(function ($group) use ($records) {
+
+            $groupRecords = $records->get(
+                $group->image_hash,
+                collect()
+            );
+
+            // Prioritaskan record yang memiliki hasil crop.
+            $sample = $groupRecords->first(function ($record) {
+
+                return !empty($record->cropped_file);
+
+            });
+
+            // Fallback ke gambar asli jika belum ada crop.
+            if (!$sample) {
+                $sample = $groupRecords->first();
+            }
+
+            return (object) [
+
+                'image_hash' => $group->image_hash,
+
+                'total_count' => $group->total_count,
+
+                'sample_file' => $sample?->filename,
+
+                'sample_crop_file' => $sample?->cropped_file,
+
+                'label' => $sample?->label,
+
+            ];
+
+        });
+
         return view('trending', compact('trendings'));
     }
 }
